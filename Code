@@ -1,0 +1,163 @@
+import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.scene.Scene;
+import javafx.scene.control.*;
+import javafx.scene.layout.*;
+import javafx.stage.Stage;
+import org.jnetpcap.Pcap;
+import org.jnetpcap.PcapIf;
+import org.jnetpcap.packet.PcapPacket;
+import org.jnetpcap.protocol.network.Arp;
+import org.jnetpcap.packet.format.FormatUtils;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class jnetpcap extends Application {
+
+    private ComboBox<PcapIf> deviceComboBox;
+    private TextArea outputArea;
+    private Thread captureThread;
+    private volatile boolean capturing = false;
+
+    @Override
+    public void start(Stage primaryStage) {
+        primaryStage.setTitle("JavaFX + jNetPcap ARP Analyzer");
+
+        deviceComboBox = new ComboBox<>();
+        outputArea = new TextArea();
+        outputArea.setEditable(false);
+
+        // Load all available network adapters
+        List<PcapIf> devices = new ArrayList<>();
+        StringBuilder errbuf = new StringBuilder();
+        int result = Pcap.findAllDevs(devices, errbuf);
+
+        if (result != Pcap.OK || devices.isEmpty()) {
+            outputArea.appendText("Error finding devices: " + errbuf + "\n");
+        } else {
+            outputArea.appendText("Detected network adapters:\n\n");
+
+            // Add all devices to ComboBox
+            for (PcapIf dev : devices) {
+                String desc = (dev.getDescription() != null) ? dev.getDescription() : "No description";
+                outputArea.appendText("Found: " + dev.getName() + " - " + desc + "\n");
+                deviceComboBox.getItems().add(dev);
+            }
+
+            // Make ComboBox show names nicely
+            deviceComboBox.setCellFactory(param -> new ListCell<>() {
+                @Override
+                protected void updateItem(PcapIf item, boolean empty) {
+                    super.updateItem(item, empty);
+                    if (empty || item == null) {
+                        setText(null);
+                    } else {
+                        setText(item.getDescription() + " (" + item.getName() + ")");
+                    }
+                }
+            });
+            deviceComboBox.setButtonCell(deviceComboBox.getCellFactory().call(null));
+
+            // Try to auto-select Wi-Fi or Ethernet adapter
+            PcapIf preferredDevice = null;
+            for (PcapIf dev : devices) {
+                String name = dev.getName().toLowerCase();
+                String desc = (dev.getDescription() != null) ? dev.getDescription().toLowerCase() : "";
+
+                if (desc.contains("realtek") || desc.contains("wi-fi") || desc.contains("ethernet")) {
+                    preferredDevice = dev;
+                    break;
+                }
+            }
+
+            if (preferredDevice != null) {
+                deviceComboBox.getSelectionModel().select(preferredDevice);
+                outputArea.appendText("\nAutomatically selected adapter: " + preferredDevice.getDescription() + "\n");
+            } else {
+                deviceComboBox.getSelectionModel().selectFirst();
+                outputArea.appendText("\nSelect your Wi-Fi or Ethernet adapter (avoid 'Loopback').\n");
+            }
+        }
+
+        Button startBtn = new Button("Start ARP Capture");
+        Button stopBtn = new Button("Stop Capture");
+
+        startBtn.setOnAction(e -> startCapture());
+        stopBtn.setOnAction(e -> stopCapture());
+
+        VBox layout = new VBox(10,
+                new Label("Select Network Adapter:"),
+                deviceComboBox,
+                new HBox(10, startBtn, stopBtn),
+                outputArea
+        );
+
+        layout.setStyle("-fx-padding: 15; -fx-font-size: 13px;");
+        Scene scene = new Scene(layout, 850, 550);
+        primaryStage.setScene(scene);
+        primaryStage.show();
+    }
+
+    private void startCapture() {
+        if (capturing) return;
+        capturing = true;
+
+        PcapIf device = deviceComboBox.getSelectionModel().getSelectedItem();
+        if (device == null) {
+            outputArea.appendText("No network adapter selected!\n");
+            return;
+        }
+
+        outputArea.appendText("\nUsing device: " + device.getName() + " - " + device.getDescription() + "\n");
+
+        captureThread = new Thread(() -> {
+            StringBuilder errbuf = new StringBuilder();
+            int snaplen = 64 * 1024;  // capture full packet
+            int flags = Pcap.MODE_PROMISCUOUS;
+            int timeout = 10;  // ms
+
+            Pcap pcap = Pcap.openLive(device.getName(), snaplen, flags, timeout, errbuf);
+            if (pcap == null) {
+                Platform.runLater(() -> outputArea.appendText("Error opening device: " + errbuf + "\n"));
+                return;
+            }
+
+            Arp arp = new Arp();
+
+            pcap.loop(Pcap.LOOP_INFINITE, (PcapPacket packet, Object user) -> {
+                if (!capturing) {
+                    pcap.breakloop();
+                    return;
+                }
+
+                if (packet.hasHeader(arp)) {
+                    String srcIp = FormatUtils.ip(arp.spa());
+                    String dstIp = FormatUtils.ip(arp.tpa());
+                    String srcMac = FormatUtils.mac(arp.sha());
+                    String dstMac = FormatUtils.mac(arp.tha());
+                    String opType = arp.operationDescription();
+
+                    String info = String.format("ARP %s: %s (%s) → %s (%s)",
+                            opType, srcIp, srcMac, dstIp, dstMac);
+
+                    Platform.runLater(() -> outputArea.appendText(info + "\n"));
+                }
+
+            }, null);
+
+            pcap.close();
+        });
+
+        captureThread.start();
+    }
+
+    private void stopCapture() {
+        capturing = false;
+        outputArea.appendText("Capture stopped.\n");
+    }
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
